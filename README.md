@@ -1,3 +1,33 @@
+# ComfyUI-OmniVoice-TTS (Vendored Transformers Fork)
+
+⚠️ **IMPORTANT: ABOUT THIS FORK** ⚠️
+
+This is a specialized fork of the original [ComfyUI-OmniVoice-TTS](https://github.com/k2-fsa/ComfyUI-OmniVoice-TTS) repository designed to prevent environment conflicts in ComfyUI.
+
+### 🌟 What is the difference from the original?
+The original OmniVoice TTS strictly requires `transformers >= 5.3.0`. However, globally upgrading `transformers` in a ComfyUI environment almost always breaks other custom nodes (like Florence-2, LLaVA, or older LLM nodes) that depend on `transformers 4.x` or earlier 5.x versions. 
+
+**This fork completely solves this issue by implementing a "Vendored Dependencies" architecture:**
+* It automatically downloads `transformers >= 5.3.0` and `huggingface_hub` into an isolated local `vendor` folder inside the custom node directory.
+* During audio generation, it uses a custom context manager to safely swap these modules into memory.
+* Once the generation is complete, it restores your system's original modules.
+* **Result:** Your global ComfyUI `transformers` version remains completely untouched. You can run OmniVoice alongside any other nodes without dependency conflicts, PyO3 crashes, or `Qwen3Config` serialization errors.
+
+### 🛠️ How to Install This Fork
+To use this version, you must clone the `vendored_transformers` branch specifically. 
+
+Open your terminal or command prompt and run the following commands:
+
+```bash
+cd ComfyUI/custom_nodes
+git clone -b vendored_transformers https://github.com/bananasss00/ComfyUI-OmniVoice-TTS.git
+```
+
+After cloning, simply **restart ComfyUI**. 
+The isolated dependencies will be automatically downloaded into the `vendor` folder during the first startup. You do not need to run `pip install` manually.
+
+---
+
 # ComfyUI-OmniVoice-TTS
 
 **OmniVoice TTS nodes for ComfyUI** — Zero-shot multilingual text-to-speech with voice cloning and voice design. Supports **600+ languages** with state-of-the-art quality.
