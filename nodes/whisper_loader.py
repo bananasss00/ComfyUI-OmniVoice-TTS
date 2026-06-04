@@ -334,16 +334,18 @@ class OmniVoiceWhisperLoader:
     )
 
     def load(self, model: str, device: str, dtype: str):
-        # Load the pipeline
-        pipe = load_whisper_pipeline(model, device, dtype)
+        from .vendor_context import vendored_transformers
+        with vendored_transformers():
+            # Load the pipeline
+            pipe = load_whisper_pipeline(model, device, dtype)
 
-        # Return as a dict with metadata
-        return ({
-            "pipeline": pipe,
-            "model_name": model,
-            "device": device,
-            "dtype": dtype,
-        },)
+            # Return as a dict with metadata
+            return ({
+                "pipeline": pipe,
+                "model_name": model,
+                "device": device,
+                "dtype": dtype,
+            },)
 
 
 # Register the folder on import

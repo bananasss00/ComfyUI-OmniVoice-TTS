@@ -345,184 +345,186 @@ if _V3:
             keep_model_loaded: bool,
             num_speakers: dict,
         ) -> IO.NodeOutput:
-            cancel_event.clear()
-            cls._check_interrupt()
+            from .vendor_context import vendored_transformers
+            with vendored_transformers():
+                cancel_event.clear()
+                cls._check_interrupt()
 
-            if not text.strip():
-                raise ValueError("Text cannot be empty.")
+                if not text.strip():
+                    raise ValueError("Text cannot be empty.")
 
-            # num_speakers is a dict from DynamicCombo:
-            n = int(num_speakers["num_speakers"])
+                # num_speakers is a dict from DynamicCombo:
+                n = int(num_speakers["num_speakers"])
 
-            # Validate speakers have reference audio
-            missing = []
-            for i in range(1, n + 1):
-                speaker_audio = num_speakers.get(f"speaker_{i}_audio")
-                if speaker_audio is None:
-                    missing.append(i)
+                # Validate speakers have reference audio
+                missing = []
+                for i in range(1, n + 1):
+                    speaker_audio = num_speakers.get(f"speaker_{i}_audio")
+                    if speaker_audio is None:
+                        missing.append(i)
 
-            if missing:
-                raise ValueError(
-                    f"Missing reference audio for speakers: {missing}. "
-                    "Please connect audio to each speaker input."
+                if missing:
+                    raise ValueError(
+                        f"Missing reference audio for speakers: {missing}. "
+                        "Please connect audio to each speaker input."
+                    )
+
+                # Load model
+                omnivoice_model, _ = get_or_load_model(
+                    model, device, dtype, attention, keep_model_loaded
                 )
 
-            # Load model
-            omnivoice_model, _ = get_or_load_model(
-                model, device, dtype, attention, keep_model_loaded
-            )
-
-            # Parse dialogue
-            dialogue_lines = _parse_dialogue_lines(text)
-            if not dialogue_lines:
-                raise ValueError(
-                    "No speaker lines found. Use [Speaker_N]: text format"
-                )
-
-            logger.info(
-                f"Multi-Speaker TTS ({n} speakers, {len(dialogue_lines)} lines)"
-            )
-
-            # Auto-detect local Whisper if any speaker needs transcription
-            any_without_ref = any(
-                not num_speakers.get(f"speaker_{i + 1}_ref_text", "").strip()
-                for i in range(n)
-            )
-            auto_whisper_pipe = None
-            if any_without_ref:
-                auto_whisper_pipe = _auto_load_whisper(model, device, dtype)
-            auto_ref_texts = {}
-            if auto_whisper_pipe is not None:
-                for i in range(n):
-                    if num_speakers.get(f"speaker_{i + 1}_ref_text", "").strip():
-                        continue
-                    speaker_audio = num_speakers.get(f"speaker_{i + 1}_audio")
-                    if speaker_audio is None:
-                        continue
-                    ref_audio_np, _ = comfy_audio_to_numpy(
-                        speaker_audio,
-                        target_sr=OMNIVOICE_SAMPLE_RATE
+                # Parse dialogue
+                dialogue_lines = _parse_dialogue_lines(text)
+                if not dialogue_lines:
+                    raise ValueError(
+                        "No speaker lines found. Use [Speaker_N]: text format"
                     )
-                    auto_ref_texts[i + 1] = transcribe_with_whisper(
-                        auto_whisper_pipe, ref_audio_np, OMNIVOICE_SAMPLE_RATE
-                    )
-                offload_whisper_to_cpu()
-
-            # Set random seed
-            actual_seed = seed if seed != 0 else torch.randint(0, 2**31, (1,)).item()
-            manual_seed_all(actual_seed)
-
-            total_steps = len(dialogue_lines) + 1
-            pbar = ProgressBar(total_steps) if _PBAR else None
-            audio_turns = []
-            sample_rate = OMNIVOICE_SAMPLE_RATE
-            result = None
-
-            try:
-                for line_idx, (speaker_idx, line_text) in enumerate(dialogue_lines):
-                    cls._check_interrupt()
-
-                    # Check speaker index is valid
-                    if speaker_idx < 0 or speaker_idx >= n:
-                        raise ValueError(
-                            f"Line {line_idx + 1} uses speaker index {speaker_idx + 1} "
-                            f"but only {n} speakers are connected."
-                        )
-
-                    # Get reference audio for this speaker
-                    speaker_audio = num_speakers.get(f"speaker_{speaker_idx + 1}_audio")
-                    speaker_ref_text = num_speakers.get(f"speaker_{speaker_idx + 1}_ref_text", "")
-
-                    if speaker_audio is None:
-                        raise ValueError(
-                            f"No reference audio for speaker {speaker_idx + 1}"
-                        )
-
-                    logger.info(
-                        f"  Line {line_idx + 1}/{len(dialogue_lines)} "
-                        f"[Speaker_{speaker_idx + 1}]: {line_text[:50]}{'...' if len(line_text) > 50 else ''}"
-                    )
-
-                    # Convert reference audio to numpy at 24kHz
-                    ref_audio_np, _ = comfy_audio_to_numpy(
-                        speaker_audio,
-                        target_sr=OMNIVOICE_SAMPLE_RATE
-                    )
-                    effective_ref_text = (
-                        speaker_ref_text.strip()
-                        or auto_ref_texts.get(speaker_idx + 1, "")
-                    )
-
-                    # Build kwargs for generate
-                    ref_audio_tensor = torch.from_numpy(ref_audio_np).float()
-                    gen_kwargs = {
-                        "text": line_text,
-                        "num_step": steps,
-                        "guidance_scale": guidance_scale,
-                        "t_shift": t_shift,
-                        "speed": speed,
-                        "ref_audio": (ref_audio_tensor, OMNIVOICE_SAMPLE_RATE),
-                        "position_temperature": position_temperature,
-                        "class_temperature": class_temperature,
-                        "layer_penalty_factor": layer_penalty_factor,
-                        "denoise": denoise,
-                        "preprocess_prompt": preprocess_prompt,
-                        "postprocess_output": postprocess_output,
-                    }
-
-                    # Only add ref_text if provided - otherwise OmniVoice uses its own Whisper
-                    if effective_ref_text:
-                        gen_kwargs["ref_text"] = effective_ref_text
-
-                    speaker_instruct = num_speakers.get(f"speaker_{speaker_idx + 1}_instruct", "")
-                    if speaker_instruct and speaker_instruct.strip():
-                        gen_kwargs["instruct"] = speaker_instruct.strip()
-
-                    # Generate audio for this line
-                    with torch.inference_mode():
-                        try:
-                            audio_list = omnivoice_model.generate(**gen_kwargs)
-                        except ValueError as e:
-                            if "instruct" in str(e).lower() or "unsupported" in str(e).lower():
-                                raise RuntimeError(
-                                    f"Invalid instruct value '{gen_kwargs.get('instruct')}'. "
-                                    f"The model only accepts specific values. Original error:\n{e}"
-                                ) from e
-                            raise
-
-                    audio_np = to_numpy_audio(audio_list[0])
-                    audio_turns.append(audio_np)
-
-                    if pbar:
-                        pbar.update_absolute(line_idx + 1, total_steps)
-
-                # Concatenate all turns with optional silence
-                if pause_between_speakers > 0:
-                    silence_samples = int(pause_between_speakers * sample_rate)
-                    silence = np.zeros(silence_samples, dtype=np.float32)
-                    parts = []
-                    for turn in audio_turns:
-                        if parts:
-                            parts.append(silence)
-                        parts.append(turn)
-                    audio_out = np.concatenate(parts, axis=0)
-                else:
-                    audio_out = np.concatenate(audio_turns, axis=0)
 
                 logger.info(
-                    f"Generated {len(audio_out) / OMNIVOICE_SAMPLE_RATE:.2f}s of multi-speaker audio "
-                    f"({n} speakers, {len(dialogue_lines)} lines)"
+                    f"Multi-Speaker TTS ({n} speakers, {len(dialogue_lines)} lines)"
                 )
 
-                result = numpy_audio_to_comfy(audio_out, sample_rate)
-
-            finally:
-                if not keep_model_loaded:
-                    unload_model()
-                    unload_whisper()
-                else:
-                    offload_model_to_cpu()
+                # Auto-detect local Whisper if any speaker needs transcription
+                any_without_ref = any(
+                    not num_speakers.get(f"speaker_{i + 1}_ref_text", "").strip()
+                    for i in range(n)
+                )
+                auto_whisper_pipe = None
+                if any_without_ref:
+                    auto_whisper_pipe = _auto_load_whisper(model, device, dtype)
+                auto_ref_texts = {}
+                if auto_whisper_pipe is not None:
+                    for i in range(n):
+                        if num_speakers.get(f"speaker_{i + 1}_ref_text", "").strip():
+                            continue
+                        speaker_audio = num_speakers.get(f"speaker_{i + 1}_audio")
+                        if speaker_audio is None:
+                            continue
+                        ref_audio_np, _ = comfy_audio_to_numpy(
+                            speaker_audio,
+                            target_sr=OMNIVOICE_SAMPLE_RATE
+                        )
+                        auto_ref_texts[i + 1] = transcribe_with_whisper(
+                            auto_whisper_pipe, ref_audio_np, OMNIVOICE_SAMPLE_RATE
+                        )
                     offload_whisper_to_cpu()
+
+                # Set random seed
+                actual_seed = seed if seed != 0 else torch.randint(0, 2**31, (1,)).item()
+                manual_seed_all(actual_seed)
+
+                total_steps = len(dialogue_lines) + 1
+                pbar = ProgressBar(total_steps) if _PBAR else None
+                audio_turns = []
+                sample_rate = OMNIVOICE_SAMPLE_RATE
+                result = None
+
+                try:
+                    for line_idx, (speaker_idx, line_text) in enumerate(dialogue_lines):
+                        cls._check_interrupt()
+
+                        # Check speaker index is valid
+                        if speaker_idx < 0 or speaker_idx >= n:
+                            raise ValueError(
+                                f"Line {line_idx + 1} uses speaker index {speaker_idx + 1} "
+                                f"but only {n} speakers are connected."
+                            )
+
+                        # Get reference audio for this speaker
+                        speaker_audio = num_speakers.get(f"speaker_{speaker_idx + 1}_audio")
+                        speaker_ref_text = num_speakers.get(f"speaker_{speaker_idx + 1}_ref_text", "")
+
+                        if speaker_audio is None:
+                            raise ValueError(
+                                f"No reference audio for speaker {speaker_idx + 1}"
+                            )
+
+                        logger.info(
+                            f"  Line {line_idx + 1}/{len(dialogue_lines)} "
+                            f"[Speaker_{speaker_idx + 1}]: {line_text[:50]}{'...' if len(line_text) > 50 else ''}"
+                        )
+
+                        # Convert reference audio to numpy at 24kHz
+                        ref_audio_np, _ = comfy_audio_to_numpy(
+                            speaker_audio,
+                            target_sr=OMNIVOICE_SAMPLE_RATE
+                        )
+                        effective_ref_text = (
+                            speaker_ref_text.strip()
+                            or auto_ref_texts.get(speaker_idx + 1, "")
+                        )
+
+                        # Build kwargs for generate
+                        ref_audio_tensor = torch.from_numpy(ref_audio_np).float()
+                        gen_kwargs = {
+                            "text": line_text,
+                            "num_step": steps,
+                            "guidance_scale": guidance_scale,
+                            "t_shift": t_shift,
+                            "speed": speed,
+                            "ref_audio": (ref_audio_tensor, OMNIVOICE_SAMPLE_RATE),
+                            "position_temperature": position_temperature,
+                            "class_temperature": class_temperature,
+                            "layer_penalty_factor": layer_penalty_factor,
+                            "denoise": denoise,
+                            "preprocess_prompt": preprocess_prompt,
+                            "postprocess_output": postprocess_output,
+                        }
+
+                        # Only add ref_text if provided - otherwise OmniVoice uses its own Whisper
+                        if effective_ref_text:
+                            gen_kwargs["ref_text"] = effective_ref_text
+
+                        speaker_instruct = num_speakers.get(f"speaker_{speaker_idx + 1}_instruct", "")
+                        if speaker_instruct and speaker_instruct.strip():
+                            gen_kwargs["instruct"] = speaker_instruct.strip()
+
+                        # Generate audio for this line
+                        with torch.inference_mode():
+                            try:
+                                audio_list = omnivoice_model.generate(**gen_kwargs)
+                            except ValueError as e:
+                                if "instruct" in str(e).lower() or "unsupported" in str(e).lower():
+                                    raise RuntimeError(
+                                        f"Invalid instruct value '{gen_kwargs.get('instruct')}'. "
+                                        f"The model only accepts specific values. Original error:\n{e}"
+                                    ) from e
+                                raise
+
+                        audio_np = to_numpy_audio(audio_list[0])
+                        audio_turns.append(audio_np)
+
+                        if pbar:
+                            pbar.update_absolute(line_idx + 1, total_steps)
+
+                    # Concatenate all turns with optional silence
+                    if pause_between_speakers > 0:
+                        silence_samples = int(pause_between_speakers * sample_rate)
+                        silence = np.zeros(silence_samples, dtype=np.float32)
+                        parts = []
+                        for turn in audio_turns:
+                            if parts:
+                                parts.append(silence)
+                            parts.append(turn)
+                        audio_out = np.concatenate(parts, axis=0)
+                    else:
+                        audio_out = np.concatenate(audio_turns, axis=0)
+
+                    logger.info(
+                        f"Generated {len(audio_out) / OMNIVOICE_SAMPLE_RATE:.2f}s of multi-speaker audio "
+                        f"({n} speakers, {len(dialogue_lines)} lines)"
+                    )
+
+                    result = numpy_audio_to_comfy(audio_out, sample_rate)
+
+                finally:
+                    if not keep_model_loaded:
+                        unload_model()
+                        unload_whisper()
+                    else:
+                        offload_model_to_cpu()
+                        offload_whisper_to_cpu()
 
             if result is None:
                 raise RuntimeError("Generation failed — see logs above.")
@@ -681,199 +683,201 @@ else:
             denoise, preprocess_prompt, postprocess_output,
             seed, keep_model_loaded, **kwargs
         ):
-            cancel_event.clear()
-            self._check_interrupt()
+            from .vendor_context import vendored_transformers
+            with vendored_transformers():
+                cancel_event.clear()
+                self._check_interrupt()
 
-            whisper_model = kwargs.get("whisper_model")
+                whisper_model = kwargs.get("whisper_model")
 
-            if not text.strip():
-                raise ValueError("Text cannot be empty.")
+                if not text.strip():
+                    raise ValueError("Text cannot be empty.")
 
-            # Validate speakers have reference audio
-            missing = []
-            for i in range(1, num_speakers + 1):
-                speaker_audio = kwargs.get(f"speaker_{i}_audio")
-                if speaker_audio is None:
-                    missing.append(i)
+                # Validate speakers have reference audio
+                missing = []
+                for i in range(1, num_speakers + 1):
+                    speaker_audio = kwargs.get(f"speaker_{i}_audio")
+                    if speaker_audio is None:
+                        missing.append(i)
 
-            if missing:
-                raise ValueError(
-                    f"Missing reference audio for speakers: {missing}. "
-                    "Please connect audio in each speaker input."
+                if missing:
+                    raise ValueError(
+                        f"Missing reference audio for speakers: {missing}. "
+                        "Please connect audio in each speaker input."
+                    )
+
+                # Load model
+                omnivoice_model, _ = get_or_load_model(
+                    model, device, dtype, attention, keep_model_loaded
                 )
 
-            # Load model
-            omnivoice_model, _ = get_or_load_model(
-                model, device, dtype, attention, keep_model_loaded
-            )
+                # Parse dialogue
+                dialogue_lines = _parse_dialogue_lines(text)
+                if not dialogue_lines:
+                    raise ValueError(
+                        "No speaker lines found. Use [Speaker_N]: text format"
+                    )
 
-            # Parse dialogue
-            dialogue_lines = _parse_dialogue_lines(text)
-            if not dialogue_lines:
-                raise ValueError(
-                    "No speaker lines found. Use [Speaker_N]: text format"
+                logger.info(
+                    f"Multi-Speaker TTS ({num_speakers} speakers, {len(dialogue_lines)} lines)"
                 )
 
-            logger.info(
-                f"Multi-Speaker TTS ({num_speakers} speakers, {len(dialogue_lines)} lines)"
-            )
+                # Auto-detect local Whisper if no Whisper node is connected
+                # and any speaker needs auto-transcription
+                any_without_ref = any(
+                    not kwargs.get(f"speaker_{i}_ref_text", "").strip()
+                    for i in range(1, num_speakers + 1)
+                )
+                auto_whisper_pipe = None
+                if any_without_ref and whisper_model is None:
+                    auto_whisper_pipe = _auto_load_whisper(model, device, dtype)
 
-            # Auto-detect local Whisper if no Whisper node is connected
-            # and any speaker needs auto-transcription
-            any_without_ref = any(
-                not kwargs.get(f"speaker_{i}_ref_text", "").strip()
-                for i in range(1, num_speakers + 1)
-            )
-            auto_whisper_pipe = None
-            if any_without_ref and whisper_model is None:
-                auto_whisper_pipe = _auto_load_whisper(model, device, dtype)
+                auto_ref_texts = {}
+                if any_without_ref:
+                    whisper_pipe = None
+                    if whisper_model is not None:
+                        whisper_pipe = get_or_cache_whisper(whisper_model, model, device, dtype)
+                    elif auto_whisper_pipe is not None:
+                        whisper_pipe = auto_whisper_pipe
 
-            auto_ref_texts = {}
-            if any_without_ref:
-                whisper_pipe = None
-                if whisper_model is not None:
-                    whisper_pipe = get_or_cache_whisper(whisper_model, model, device, dtype)
-                elif auto_whisper_pipe is not None:
-                    whisper_pipe = auto_whisper_pipe
+                    if whisper_pipe is not None:
+                        for i in range(1, num_speakers + 1):
+                            if kwargs.get(f"speaker_{i}_ref_text", "").strip():
+                                continue
+                            speaker_audio = kwargs.get(f"speaker_{i}_audio")
+                            if speaker_audio is None:
+                                continue
+                            ref_audio_np, _ = comfy_audio_to_numpy(
+                                speaker_audio,
+                                target_sr=OMNIVOICE_SAMPLE_RATE
+                            )
+                            auto_ref_texts[i] = transcribe_with_whisper(
+                                whisper_pipe, ref_audio_np, OMNIVOICE_SAMPLE_RATE
+                            )
+                        offload_whisper_to_cpu()
 
-                if whisper_pipe is not None:
-                    for i in range(1, num_speakers + 1):
-                        if kwargs.get(f"speaker_{i}_ref_text", "").strip():
-                            continue
-                        speaker_audio = kwargs.get(f"speaker_{i}_audio")
+                # Set random seed
+                actual_seed = seed if seed != 0 else torch.randint(0, 2**31, (1,)).item()
+                manual_seed_all(actual_seed)
+
+                total_steps = len(dialogue_lines) + 1
+                pbar = ProgressBar(total_steps) if _PBAR else None
+                audio_turns = []
+                sample_rate = OMNIVOICE_SAMPLE_RATE
+
+                # Track which speakers used up-front Whisper transcription.
+                speakers_need_whisper = set(auto_ref_texts)
+                result = None
+
+                try:
+                    for line_idx, (speaker_idx, line_text) in enumerate(dialogue_lines):
+                        self._check_interrupt()
+
+                        # Check speaker index is valid
+                        if speaker_idx < 0 or speaker_idx >= num_speakers:
+                            raise ValueError(
+                                f"Line {line_idx + 1} uses speaker index {speaker_idx + 1} "
+                                f"but only {num_speakers} speakers are connected."
+                            )
+
+                        # Get reference audio for this speaker
+                        speaker_audio = kwargs.get(f"speaker_{speaker_idx + 1}_audio")
+                        speaker_ref_text = kwargs.get(f"speaker_{speaker_idx + 1}_ref_text", "")
+
                         if speaker_audio is None:
-                            continue
+                            raise ValueError(
+                                f"No reference audio for speaker {speaker_idx + 1}"
+                            )
+
+                        logger.info(
+                            f"  Line {line_idx + 1}/{len(dialogue_lines)} "
+                            f"[Speaker_{speaker_idx + 1}]: {line_text[:50]}{'...' if len(line_text) > 50 else ''}"
+                        )
+
+                        # Convert reference audio to numpy at 24kHz
                         ref_audio_np, _ = comfy_audio_to_numpy(
                             speaker_audio,
                             target_sr=OMNIVOICE_SAMPLE_RATE
                         )
-                        auto_ref_texts[i] = transcribe_with_whisper(
-                            whisper_pipe, ref_audio_np, OMNIVOICE_SAMPLE_RATE
-                        )
-                    offload_whisper_to_cpu()
-
-            # Set random seed
-            actual_seed = seed if seed != 0 else torch.randint(0, 2**31, (1,)).item()
-            manual_seed_all(actual_seed)
-
-            total_steps = len(dialogue_lines) + 1
-            pbar = ProgressBar(total_steps) if _PBAR else None
-            audio_turns = []
-            sample_rate = OMNIVOICE_SAMPLE_RATE
-
-            # Track which speakers used up-front Whisper transcription.
-            speakers_need_whisper = set(auto_ref_texts)
-            result = None
-
-            try:
-                for line_idx, (speaker_idx, line_text) in enumerate(dialogue_lines):
-                    self._check_interrupt()
-
-                    # Check speaker index is valid
-                    if speaker_idx < 0 or speaker_idx >= num_speakers:
-                        raise ValueError(
-                            f"Line {line_idx + 1} uses speaker index {speaker_idx + 1} "
-                            f"but only {num_speakers} speakers are connected."
+                        effective_ref_text = (
+                            speaker_ref_text.strip()
+                            or auto_ref_texts.get(speaker_idx + 1, "")
                         )
 
-                    # Get reference audio for this speaker
-                    speaker_audio = kwargs.get(f"speaker_{speaker_idx + 1}_audio")
-                    speaker_ref_text = kwargs.get(f"speaker_{speaker_idx + 1}_ref_text", "")
+                        # Build kwargs for generate
+                        ref_audio_tensor = torch.from_numpy(ref_audio_np).float()
+                        gen_kwargs = {
+                            "text": line_text,
+                            "num_step": steps,
+                            "guidance_scale": guidance_scale,
+                            "t_shift": t_shift,
+                            "speed": speed,
+                            "ref_audio": (ref_audio_tensor, OMNIVOICE_SAMPLE_RATE),
+                            "position_temperature": position_temperature,
+                            "class_temperature": class_temperature,
+                            "layer_penalty_factor": layer_penalty_factor,
+                            "denoise": denoise,
+                            "preprocess_prompt": preprocess_prompt,
+                            "postprocess_output": postprocess_output,
+                        }
 
-                    if speaker_audio is None:
-                        raise ValueError(
-                            f"No reference audio for speaker {speaker_idx + 1}"
-                        )
+                        # Only add ref_text if provided - otherwise let OmniVoice use Whisper
+                        if effective_ref_text:
+                            gen_kwargs["ref_text"] = effective_ref_text
+
+                        speaker_instruct = kwargs.get(f"speaker_{speaker_idx + 1}_instruct", "")
+                        if speaker_instruct and speaker_instruct.strip():
+                            gen_kwargs["instruct"] = speaker_instruct.strip()
+
+                        # Generate audio for this line
+                        with torch.inference_mode():
+                            try:
+                                audio_list = omnivoice_model.generate(**gen_kwargs)
+                            except ValueError as e:
+                                if "instruct" in str(e).lower() or "unsupported" in str(e).lower():
+                                    raise RuntimeError(
+                                        f"Invalid instruct value '{gen_kwargs.get('instruct')}'. "
+                                        f"The model only accepts specific values. Original error:\n{e}"
+                                    ) from e
+                                raise
+
+                        audio_np = to_numpy_audio(audio_list[0])
+                        audio_turns.append(audio_np)
+
+                        if pbar:
+                            pbar.update_absolute(line_idx + 1, total_steps)
+
+                    # Log Whisper usage
+                    if speakers_need_whisper:
+                        logger.info(f"Used pre-loaded Whisper for speakers: {sorted(speakers_need_whisper)}")
+
+                    # Concatenate all turns with optional silence
+                    if pause_between_speakers > 0:
+                        silence_samples = int(pause_between_speakers * sample_rate)
+                        silence = np.zeros(silence_samples, dtype=np.float32)
+                        parts = []
+                        for turn in audio_turns:
+                            if parts:
+                                parts.append(silence)
+                            parts.append(turn)
+                        audio_out = np.concatenate(parts, axis=0)
+                    else:
+                        audio_out = np.concatenate(audio_turns, axis=0)
 
                     logger.info(
-                        f"  Line {line_idx + 1}/{len(dialogue_lines)} "
-                        f"[Speaker_{speaker_idx + 1}]: {line_text[:50]}{'...' if len(line_text) > 50 else ''}"
+                        f"Generated {len(audio_out) / OMNIVOICE_SAMPLE_RATE:.2f}s of multi-speaker audio "
+                        f"({num_speakers} speakers, {len(dialogue_lines)} lines)"
                     )
 
-                    # Convert reference audio to numpy at 24kHz
-                    ref_audio_np, _ = comfy_audio_to_numpy(
-                        speaker_audio,
-                        target_sr=OMNIVOICE_SAMPLE_RATE
-                    )
-                    effective_ref_text = (
-                        speaker_ref_text.strip()
-                        or auto_ref_texts.get(speaker_idx + 1, "")
-                    )
+                    result = numpy_audio_to_comfy(audio_out, sample_rate)
 
-                    # Build kwargs for generate
-                    ref_audio_tensor = torch.from_numpy(ref_audio_np).float()
-                    gen_kwargs = {
-                        "text": line_text,
-                        "num_step": steps,
-                        "guidance_scale": guidance_scale,
-                        "t_shift": t_shift,
-                        "speed": speed,
-                        "ref_audio": (ref_audio_tensor, OMNIVOICE_SAMPLE_RATE),
-                        "position_temperature": position_temperature,
-                        "class_temperature": class_temperature,
-                        "layer_penalty_factor": layer_penalty_factor,
-                        "denoise": denoise,
-                        "preprocess_prompt": preprocess_prompt,
-                        "postprocess_output": postprocess_output,
-                    }
-
-                    # Only add ref_text if provided - otherwise let OmniVoice use Whisper
-                    if effective_ref_text:
-                        gen_kwargs["ref_text"] = effective_ref_text
-
-                    speaker_instruct = kwargs.get(f"speaker_{speaker_idx + 1}_instruct", "")
-                    if speaker_instruct and speaker_instruct.strip():
-                        gen_kwargs["instruct"] = speaker_instruct.strip()
-
-                    # Generate audio for this line
-                    with torch.inference_mode():
-                        try:
-                            audio_list = omnivoice_model.generate(**gen_kwargs)
-                        except ValueError as e:
-                            if "instruct" in str(e).lower() or "unsupported" in str(e).lower():
-                                raise RuntimeError(
-                                    f"Invalid instruct value '{gen_kwargs.get('instruct')}'. "
-                                    f"The model only accepts specific values. Original error:\n{e}"
-                                ) from e
-                            raise
-
-                    audio_np = to_numpy_audio(audio_list[0])
-                    audio_turns.append(audio_np)
-
-                    if pbar:
-                        pbar.update_absolute(line_idx + 1, total_steps)
-
-                # Log Whisper usage
-                if speakers_need_whisper:
-                    logger.info(f"Used pre-loaded Whisper for speakers: {sorted(speakers_need_whisper)}")
-
-                # Concatenate all turns with optional silence
-                if pause_between_speakers > 0:
-                    silence_samples = int(pause_between_speakers * sample_rate)
-                    silence = np.zeros(silence_samples, dtype=np.float32)
-                    parts = []
-                    for turn in audio_turns:
-                        if parts:
-                            parts.append(silence)
-                        parts.append(turn)
-                    audio_out = np.concatenate(parts, axis=0)
-                else:
-                    audio_out = np.concatenate(audio_turns, axis=0)
-
-                logger.info(
-                    f"Generated {len(audio_out) / OMNIVOICE_SAMPLE_RATE:.2f}s of multi-speaker audio "
-                    f"({num_speakers} speakers, {len(dialogue_lines)} lines)"
-                )
-
-                result = numpy_audio_to_comfy(audio_out, sample_rate)
-
-            finally:
-                if not keep_model_loaded:
-                    unload_model()
-                    unload_whisper()
-                else:
-                    offload_model_to_cpu()
-                    offload_whisper_to_cpu()
+                finally:
+                    if not keep_model_loaded:
+                        unload_model()
+                        unload_whisper()
+                    else:
+                        offload_model_to_cpu()
+                        offload_whisper_to_cpu()
 
             if result is None:
                 raise RuntimeError("Generation failed — see logs above.")

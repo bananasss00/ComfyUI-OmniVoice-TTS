@@ -18,8 +18,38 @@ import logging
 import sys
 import types
 import importlib.util
+import os
+import subprocess
 from pathlib import Path
 from typing import Any, Dict
+
+def setup_vendored_dependencies():
+    """Download and isolate transformers 5.x into a local vendor directory."""
+    current_directory = os.path.dirname(os.path.abspath(__file__))
+    vendor_directory = os.path.join(current_directory, "vendor")
+    check_file_path = os.path.join(vendor_directory, "transformers", "__init__.py")
+    
+    if not os.path.exists(check_file_path):
+        print("[OmniVoice] Vendored dependencies not found. Starting installation to vendor directory...")
+        os.makedirs(vendor_directory, exist_ok=True)
+        
+        installation_command = [
+            sys.executable, "-m", "pip", "install",
+            "transformers>=5.3.0",
+            "huggingface_hub",
+            "--target", vendor_directory,
+            "--upgrade",
+            "--no-deps",
+            "--quiet"
+        ]
+        
+        try:
+            subprocess.run(installation_command, check=True)
+            print("[OmniVoice] Dependencies successfully installed to the isolated environment.")
+        except subprocess.CalledProcessError as exception:
+            print(f"[OmniVoice] Dependency installation failed: {exception}")
+
+setup_vendored_dependencies()
 
 # ---------------------------------------------------------------------------
 # Pre-emptively block torchcodec from crashing on incompatible PyTorch builds
@@ -66,13 +96,17 @@ if _tc_broken or _tc is None or getattr(_tc, '__spec__', None) is None:
 
     # transformers/audio_utils.py calls importlib.metadata.version("torchcodec")
     # at module level — this fails because stub has no pip metadata on disk.
-    # Patch metadata.version() to return a fake version for torchcodec only.
+    # Patch metadata.version() to return a fake version for torchcodec and tokenizers.
     import importlib.metadata as _ilm
     _orig_ilm_version = _ilm.version
+    
     def _patched_ilm_version(name):
         if name == "torchcodec":
             return "0.0.0"
+        if name == "tokenizers":
+            return "0.23.0"  # Bypass strict transformers version check
         return _orig_ilm_version(name)
+        
     _ilm.version = _patched_ilm_version
 
     logging.getLogger("OmniVoice").info(
@@ -96,88 +130,57 @@ if not logger.handlers:
 
 
 def _check_dependencies() -> tuple[bool, list[tuple[str, list[str]]]]:
-    """Check if omnivoice and its critical dependencies are importable.
-
-    Returns:
-        (ready, missing) where *missing* is a list of (package_name, extra_args)
-        tuples.  *extra_args* are pip flags like ``["--upgrade"]`` needed
-        beyond a plain ``pip install <pkg>``.
-    """
-    try:
-        import omnivoice
-    except ImportError as e:
-        # Check if omnivoice package exists on disk (findable) but a
-        # sub-dependency is missing.  If so, reinstalling with --no-deps
-        # won't help — the missing dep needs to be installed separately.
-        if importlib.util.find_spec("omnivoice") is not None:
-            _missing_dep = getattr(e, 'name', None) or 'unknown'
-            logger.error(
-                f"omnivoice is installed but failed to import: {e}"
-            )
-            # Known sub-deps from install.py — give the correct install command
-            _managed = {
-                "soxr": ["--no-deps"],
-                "soundfile": ["--no-deps"],
-                "scipy": ["--no-deps"],
-                "lazy_loader": ["--no-deps"],
-                "librosa": ["--no-deps"],
-                "sentencepiece": ["--no-deps"],
-                "jieba": ["--no-deps"],
-                "pydub": [],
-                "transformers": ["--upgrade"],
-            }
-            if _missing_dep in _managed:
-                _flags = _managed[_missing_dep]
-                _cmd = " ".join([sys.executable, "-m", "pip", "install"] + _flags + [_missing_dep])
-                logger.error(
-                    f"Missing dependency: '{_missing_dep}'. "
-                    f"Run: {_cmd}"
-                )
-            else:
-                logger.error(
-                    f"Missing or broken dependency: '{_missing_dep}'. "
-                    f"Please report this issue on GitHub."
-                )
-            return False, []
-        # Genuinely not installed
-        logger.warning(f"omnivoice not installed: {e}")
-        return False, [("omnivoice", ["--no-deps"])]
-    except Exception as e:
-        # Installed but broken — reinstalling won't help, just warn
-        logger.error(f"omnivoice is installed but failed to import: {e}")
-        logger.error("Reinstalling will not fix this. Check the error above.")
-        return False, []
-
-    # Sub-dependencies that ``pip install omnivoice --no-deps`` skips.
-    missing: list[tuple[str, list[str]]] = []
-
-    try:
-        import soxr
-    except ImportError:
-        missing.append(("soxr", []))
-
-    try:
-        import transformers
-    except ImportError:
-        missing.append(("transformers", ["--upgrade"]))
-    else:
-        # transformers is installed but may be too old — check version.
-        # OmniVoice needs transformers >= 5.3 (HiggsAudioV2TokenizerModel support).
+    """Check if omnivoice and its critical dependencies are importable."""
+    from .nodes.vendor_context import vendored_transformers
+    
+    with vendored_transformers():
         try:
-            current = tuple(int(x) for x in transformers.__version__.split(".")[:2])
-            if current < (5, 3):
-                logger.warning("=" * 60)
-                logger.warning(" OmniVoice WARNING: transformers is too old!")
-                logger.warning(f" Installed: {transformers.__version__}, need >= 5.3.0")
-                logger.warning(' Run: pip install "transformers>=5.3.0"')
-                logger.warning(" NOTE: This may break other ComfyUI nodes that")
-                logger.warning("       depend on older versions of transformers.")
-                logger.warning("=" * 60)
-                # Don't add to missing — don't auto-upgrade, let user decide
-        except (ValueError, AttributeError):
-            pass
+            import omnivoice
+        except ImportError as exception:
+            if importlib.util.find_spec("omnivoice") is not None:
+                missing_dependency = getattr(exception, 'name', None) or 'unknown'
+                logger.error(
+                    f"omnivoice is installed but failed to import: {exception}"
+                )
+                managed_dependencies = {
+                    "soxr": ["--no-deps"],
+                    "soundfile": ["--no-deps"],
+                    "scipy": ["--no-deps"],
+                    "lazy_loader": ["--no-deps"],
+                    "librosa": ["--no-deps"],
+                    "sentencepiece": ["--no-deps"],
+                    "jieba": ["--no-deps"],
+                    "pydub": [],
+                }
+                if missing_dependency in managed_dependencies:
+                    flags = managed_dependencies[missing_dependency]
+                    command = " ".join([sys.executable, "-m", "pip", "install"] + flags + [missing_dependency])
+                    logger.error(
+                        f"Missing dependency: '{missing_dependency}'. "
+                        f"Run: {command}"
+                    )
+                else:
+                    logger.error(
+                        f"Missing or broken dependency: '{missing_dependency}'. "
+                        f"Please report this issue on GitHub."
+                    )
+                return False, []
+            
+            logger.warning(f"omnivoice not installed: {exception}")
+            return False, [("omnivoice", ["--no-deps"])]
+        except Exception as exception:
+            logger.error(f"omnivoice is installed but failed to import: {exception}")
+            logger.error("Reinstalling will not fix this. Check the error above.")
+            return False, []
 
-    return (len(missing) == 0), missing
+        missing_packages: list[tuple[str, list[str]]] = []
+
+        try:
+            import soxr
+        except ImportError:
+            missing_packages.append(("soxr", []))
+
+        return (len(missing_packages) == 0), missing_packages
 
 
 # ---------------------------------------------------------------------------
@@ -241,6 +244,9 @@ elif _deps_missing:
 
         for _pkg, _extra_args in _deps_missing:
             _cmd = [sys.executable, "-m", "pip", "install"] + _extra_args + [_pkg]
+            if _pkg == "transformers":
+                vendor_dir = os.path.join(_HERE, "vendor")
+                _cmd += ["--target", vendor_dir, "--no-deps"]
             logger.warning(f"Installing {_pkg} ...")
             _result = subprocess.run(_cmd, capture_output=True, text=True, timeout=120)
             if _result.returncode == 0:

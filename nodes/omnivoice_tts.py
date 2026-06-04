@@ -468,181 +468,183 @@ class OmniVoiceLongformTTS:
         ref_audio: dict = None,
         whisper_model: dict = None,
     ) -> Tuple[dict]:
-        cancel_event.clear()
-        self._check_interrupt()
+        from .vendor_context import vendored_transformers
+        with vendored_transformers():
+            cancel_event.clear()
+            self._check_interrupt()
 
-        if not text.strip():
-            raise ValueError("Text cannot be empty.")
+            if not text.strip():
+                raise ValueError("Text cannot be empty.")
 
-        omnivoice_model, _ = get_or_load_model(
-            model, device, dtype, attention, keep_model_loaded
-        )
-
-        # Set random seed early so Whisper transcription is also seeded
-        actual_seed = seed if seed != 0 else torch.randint(0, 2**31, (1,)).item()
-        manual_seed_all(actual_seed)
-
-        use_voice_clone = ref_audio is not None
-
-        ref_audio_tensor = None
-        effective_ref_text = ref_text.strip()
-        if use_voice_clone:
-            logger.info("Processing reference audio for voice cloning...")
-            ref_audio_np, _ = comfy_audio_to_numpy(ref_audio, target_sr=OMNIVOICE_SAMPLE_RATE)
-            ref_audio_tensor = torch.from_numpy(ref_audio_np).float()
-
-            ref_duration = len(ref_audio_np) / OMNIVOICE_SAMPLE_RATE
-            if ref_duration < 1:
-                logger.warning(
-                    f"Reference audio is only {ref_duration:.1f}s — "
-                    "recommend 3-15s for best quality."
-                )
-            elif ref_duration > 30:
-                logger.warning(
-                    f"Reference audio is {ref_duration:.1f}s — "
-                    "longer than recommended 15s may cause issues."
-                )
-
-            if not effective_ref_text and whisper_model is not None:
-                whisper_pipe = get_or_cache_whisper(whisper_model, model, device, dtype)
-                if whisper_pipe is not None:
-                    logger.info("Using pre-loaded Whisper ASR for voice transcription")
-                    effective_ref_text = transcribe_with_whisper(
-                        whisper_pipe, ref_audio_np, OMNIVOICE_SAMPLE_RATE
-                    )
-                    offload_whisper_to_cpu()
-            elif not effective_ref_text:
-                # Check for locally downloaded Whisper before letting OmniVoice download
-                local_name = find_local_whisper_model()
-                if local_name is not None:
-                    logger.info(
-                        f"No ref_text — auto-detected local Whisper "
-                        f"({local_name}) for transcription"
-                    )
-                    try:
-                        pipe = load_whisper_pipeline(local_name, device, dtype)
-                        get_or_cache_whisper(
-                            {"pipeline": pipe, "model_name": local_name},
-                            model, device, dtype,
-                        )
-                        effective_ref_text = transcribe_with_whisper(
-                            pipe, ref_audio_np, OMNIVOICE_SAMPLE_RATE
-                        )
-                        offload_whisper_to_cpu()
-                    except Exception as e:
-                        logger.warning(f"Failed to load local Whisper: {e}")
-                        logger.info("No ref_text — Whisper will auto-transcribe (downloads if not cached)")
-                else:
-                    logger.info("No ref_text — Whisper will auto-transcribe (downloads if not cached)")
-
-        chunks = _smart_chunk_text(text, words_per_chunk)
-
-        if len(chunks) > 1:
-            logger.info(f"Long text detected — splitting into {len(chunks)} chunks at sentence boundaries")
-
-        total_chunks = len(chunks)
-        pbar = ProgressBar(total_chunks + 1) if _PBAR else None
-
-        preview = text[:80] + "..." if len(text) > 80 else text
-        mode = "voice clone" if use_voice_clone else "auto voice"
-        logger.info(f"Longform TTS ({mode}): {preview}")
-
-        if pbar:
-            pbar.update_absolute(1, total_chunks + 1)
-
-        self._check_interrupt()
-
-        audio_chunks = []
-        result = None
-        auto_ref_audio_tensor = None
-        first_chunk_text = ""
-
-        try:
-            for chunk_idx, chunk_text in enumerate(chunks):
-                self._check_interrupt()
-
-                if len(chunks) > 1:
-                    logger.info(f"  Chunk {chunk_idx + 1}/{len(chunks)}: {chunk_text[:50]}{'...' if len(chunk_text) > 50 else ''}")
-
-                gen_kwargs = {
-                    "text": chunk_text,
-                    "num_step": steps,
-                    "guidance_scale": guidance_scale,
-                    "t_shift": t_shift,
-                    "speed": speed,
-                    "position_temperature": position_temperature,
-                    "class_temperature": class_temperature,
-                    "layer_penalty_factor": layer_penalty_factor,
-                    "denoise": denoise,
-                    "preprocess_prompt": preprocess_prompt,
-                    "postprocess_output": postprocess_output,
-                }
-
-                # Auto-voice consistency: use first chunk's output as
-                # reference for all subsequent chunks to keep the same voice.
-                if not use_voice_clone and chunk_idx > 0 and auto_ref_audio_tensor is not None:
-                    gen_kwargs["ref_audio"] = (auto_ref_audio_tensor, OMNIVOICE_SAMPLE_RATE)
-                    gen_kwargs["ref_text"] = first_chunk_text
-                elif use_voice_clone:
-                    gen_kwargs["ref_audio"] = (ref_audio_tensor, OMNIVOICE_SAMPLE_RATE)
-                    if effective_ref_text:
-                        gen_kwargs["ref_text"] = effective_ref_text
-
-                if instruct and instruct.strip():
-                    gen_kwargs["instruct"] = instruct.strip()
-
-                if duration > 0:
-                    gen_kwargs["duration"] = duration
-
-                with torch.inference_mode():
-                    try:
-                        audio_list = omnivoice_model.generate(**gen_kwargs)
-                    except ValueError as e:
-                        if "instruct" in str(e).lower() or "unsupported" in str(e).lower():
-                            raise RuntimeError(
-                                f"Invalid instruct value '{gen_kwargs.get('instruct')}'. "
-                                f"The model only accepts specific values. Original error:\n{e}"
-                            ) from e
-                        raise
-
-                audio_np = to_numpy_audio(audio_list[0])
-                audio_chunks.append(audio_np)
-
-                # Capture first chunk audio as reference for auto-voice consistency
-                if not use_voice_clone and chunk_idx == 0 and len(chunks) > 1:
-                    max_ref_samples = 25 * OMNIVOICE_SAMPLE_RATE
-                    if len(audio_np) > max_ref_samples:
-                        auto_ref_audio_np = audio_np[:max_ref_samples]
-                        logger.info("  Cropped auto-reference audio to 25s for voice consistency")
-                    else:
-                        auto_ref_audio_np = audio_np
-                    auto_ref_audio_tensor = torch.from_numpy(auto_ref_audio_np).float()
-                    first_chunk_text = chunk_text
-                    ref_dur = len(auto_ref_audio_np) / OMNIVOICE_SAMPLE_RATE
-                    logger.info(f"  Using first chunk ({ref_dur:.1f}s) as voice reference for remaining chunks")
-
-                if pbar:
-                    pbar.update_absolute(chunk_idx + 2, total_chunks + 1)
-
-            if len(audio_chunks) == 1:
-                audio_out = audio_chunks[0]
-            else:
-                audio_out = np.concatenate(audio_chunks, axis=0)
-
-            result = numpy_audio_to_comfy(audio_out, OMNIVOICE_SAMPLE_RATE)
-
-            logger.info(
-                f"Generated {len(audio_out) / OMNIVOICE_SAMPLE_RATE:.2f}s of audio "
-                f"at {OMNIVOICE_SAMPLE_RATE}Hz"
+            omnivoice_model, _ = get_or_load_model(
+                model, device, dtype, attention, keep_model_loaded
             )
 
-        finally:
-            if not keep_model_loaded:
-                unload_model()
-                unload_whisper()
-            else:
-                offload_model_to_cpu()
-                offload_whisper_to_cpu()
+            # Set random seed early so Whisper transcription is also seeded
+            actual_seed = seed if seed != 0 else torch.randint(0, 2**31, (1,)).item()
+            manual_seed_all(actual_seed)
+
+            use_voice_clone = ref_audio is not None
+
+            ref_audio_tensor = None
+            effective_ref_text = ref_text.strip()
+            if use_voice_clone:
+                logger.info("Processing reference audio for voice cloning...")
+                ref_audio_np, _ = comfy_audio_to_numpy(ref_audio, target_sr=OMNIVOICE_SAMPLE_RATE)
+                ref_audio_tensor = torch.from_numpy(ref_audio_np).float()
+
+                ref_duration = len(ref_audio_np) / OMNIVOICE_SAMPLE_RATE
+                if ref_duration < 1:
+                    logger.warning(
+                        f"Reference audio is only {ref_duration:.1f}s — "
+                        "recommend 3-15s for best quality."
+                    )
+                elif ref_duration > 30:
+                    logger.warning(
+                        f"Reference audio is {ref_duration:.1f}s — "
+                        "longer than recommended 15s may cause issues."
+                    )
+
+                if not effective_ref_text and whisper_model is not None:
+                    whisper_pipe = get_or_cache_whisper(whisper_model, model, device, dtype)
+                    if whisper_pipe is not None:
+                        logger.info("Using pre-loaded Whisper ASR for voice transcription")
+                        effective_ref_text = transcribe_with_whisper(
+                            whisper_pipe, ref_audio_np, OMNIVOICE_SAMPLE_RATE
+                        )
+                        offload_whisper_to_cpu()
+                elif not effective_ref_text:
+                    # Check for locally downloaded Whisper before letting OmniVoice download
+                    local_name = find_local_whisper_model()
+                    if local_name is not None:
+                        logger.info(
+                            f"No ref_text — auto-detected local Whisper "
+                            f"({local_name}) for transcription"
+                        )
+                        try:
+                            pipe = load_whisper_pipeline(local_name, device, dtype)
+                            get_or_cache_whisper(
+                                {"pipeline": pipe, "model_name": local_name},
+                                model, device, dtype,
+                            )
+                            effective_ref_text = transcribe_with_whisper(
+                                pipe, ref_audio_np, OMNIVOICE_SAMPLE_RATE
+                            )
+                            offload_whisper_to_cpu()
+                        except Exception as e:
+                            logger.warning(f"Failed to load local Whisper: {e}")
+                            logger.info("No ref_text — Whisper will auto-transcribe (downloads if not cached)")
+                    else:
+                        logger.info("No ref_text — Whisper will auto-transcribe (downloads if not cached)")
+
+            chunks = _smart_chunk_text(text, words_per_chunk)
+
+            if len(chunks) > 1:
+                logger.info(f"Long text detected — splitting into {len(chunks)} chunks at sentence boundaries")
+
+            total_chunks = len(chunks)
+            pbar = ProgressBar(total_chunks + 1) if _PBAR else None
+
+            preview = text[:80] + "..." if len(text) > 80 else text
+            mode = "voice clone" if use_voice_clone else "auto voice"
+            logger.info(f"Longform TTS ({mode}): {preview}")
+
+            if pbar:
+                pbar.update_absolute(1, total_chunks + 1)
+
+            self._check_interrupt()
+
+            audio_chunks = []
+            result = None
+            auto_ref_audio_tensor = None
+            first_chunk_text = ""
+
+            try:
+                for chunk_idx, chunk_text in enumerate(chunks):
+                    self._check_interrupt()
+
+                    if len(chunks) > 1:
+                        logger.info(f"  Chunk {chunk_idx + 1}/{len(chunks)}: {chunk_text[:50]}{'...' if len(chunk_text) > 50 else ''}")
+
+                    gen_kwargs = {
+                        "text": chunk_text,
+                        "num_step": steps,
+                        "guidance_scale": guidance_scale,
+                        "t_shift": t_shift,
+                        "speed": speed,
+                        "position_temperature": position_temperature,
+                        "class_temperature": class_temperature,
+                        "layer_penalty_factor": layer_penalty_factor,
+                        "denoise": denoise,
+                        "preprocess_prompt": preprocess_prompt,
+                        "postprocess_output": postprocess_output,
+                    }
+
+                    # Auto-voice consistency: use first chunk's output as
+                    # reference for all subsequent chunks to keep the same voice.
+                    if not use_voice_clone and chunk_idx > 0 and auto_ref_audio_tensor is not None:
+                        gen_kwargs["ref_audio"] = (auto_ref_audio_tensor, OMNIVOICE_SAMPLE_RATE)
+                        gen_kwargs["ref_text"] = first_chunk_text
+                    elif use_voice_clone:
+                        gen_kwargs["ref_audio"] = (ref_audio_tensor, OMNIVOICE_SAMPLE_RATE)
+                        if effective_ref_text:
+                            gen_kwargs["ref_text"] = effective_ref_text
+
+                    if instruct and instruct.strip():
+                        gen_kwargs["instruct"] = instruct.strip()
+
+                    if duration > 0:
+                        gen_kwargs["duration"] = duration
+
+                    with torch.inference_mode():
+                        try:
+                            audio_list = omnivoice_model.generate(**gen_kwargs)
+                        except ValueError as e:
+                            if "instruct" in str(e).lower() or "unsupported" in str(e).lower():
+                                raise RuntimeError(
+                                    f"Invalid instruct value '{gen_kwargs.get('instruct')}'. "
+                                    f"The model only accepts specific values. Original error:\n{e}"
+                                ) from e
+                            raise
+
+                    audio_np = to_numpy_audio(audio_list[0])
+                    audio_chunks.append(audio_np)
+
+                    # Capture first chunk audio as reference for auto-voice consistency
+                    if not use_voice_clone and chunk_idx == 0 and len(chunks) > 1:
+                        max_ref_samples = 25 * OMNIVOICE_SAMPLE_RATE
+                        if len(audio_np) > max_ref_samples:
+                            auto_ref_audio_np = audio_np[:max_ref_samples]
+                            logger.info("  Cropped auto-reference audio to 25s for voice consistency")
+                        else:
+                            auto_ref_audio_np = audio_np
+                        auto_ref_audio_tensor = torch.from_numpy(auto_ref_audio_np).float()
+                        first_chunk_text = chunk_text
+                        ref_dur = len(auto_ref_audio_np) / OMNIVOICE_SAMPLE_RATE
+                        logger.info(f"  Using first chunk ({ref_dur:.1f}s) as voice reference for remaining chunks")
+
+                    if pbar:
+                        pbar.update_absolute(chunk_idx + 2, total_chunks + 1)
+
+                if len(audio_chunks) == 1:
+                    audio_out = audio_chunks[0]
+                else:
+                    audio_out = np.concatenate(audio_chunks, axis=0)
+
+                result = numpy_audio_to_comfy(audio_out, OMNIVOICE_SAMPLE_RATE)
+
+                logger.info(
+                    f"Generated {len(audio_out) / OMNIVOICE_SAMPLE_RATE:.2f}s of audio "
+                    f"at {OMNIVOICE_SAMPLE_RATE}Hz"
+                )
+
+            finally:
+                if not keep_model_loaded:
+                    unload_model()
+                    unload_whisper()
+                else:
+                    offload_model_to_cpu()
+                    offload_whisper_to_cpu()
 
         if result is None:
             raise RuntimeError("Generation failed — see logs above.")

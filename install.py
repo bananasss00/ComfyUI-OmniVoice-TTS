@@ -14,6 +14,7 @@ We work around this by installing omnivoice with --no-deps.
 """
 
 import importlib
+import os
 import subprocess
 import sys
 
@@ -48,15 +49,16 @@ def is_installed(package_name):
     return importlib.util.find_spec(package_name) is not None
 
 
-def pip_install(package, no_deps=False, upgrade=False):
+def pip_install(package, no_deps=False, upgrade=False, target=None):
     """Install a package with pip. Returns True on success."""
-    # Use uv if available (faster), otherwise pip
     python = sys.executable
     flags = []
     if no_deps:
         flags.append("--no-deps")
     if upgrade:
         flags.append("--upgrade")
+    if target:
+        flags.append(f"--target={target}")
 
     # Try uv first
     cmd = [python, "-m", "uv", "pip", "install", package] + flags
@@ -82,38 +84,30 @@ def check_torch():
 
 
 def main():
-    # Early exit only if omnivoice AND all critical sub-deps import cleanly.
-    # We do NOT check CUDA availability — it's irrelevant to whether deps
-    # are installed.  We actually import the modules (not just find_spec)
-    # to catch broken installs where the package is on disk but can't load.
+    # Check if dependencies can be loaded using the vendor directory fallback
+    vendor_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "vendor")
+    if os.path.exists(vendor_dir):
+        sys.path.insert(0, vendor_dir)
+        
     try:
         import omnivoice  # noqa: F401
         import soxr      # noqa: F401
         import transformers  # noqa: F401
-        # Verify transformers is new enough (>= 5.3 for HiggsAudioV2TokenizerModel)
         _tv = tuple(int(x) for x in transformers.__version__.split(".")[:2])
         if _tv < (5, 3):
-            print("=" * 60)
-            print(" [OmniVoice] WARNING: transformers is too old!")
-            print(f"  Installed: {transformers.__version__}, need >= 5.3.0")
-            print('  Run: pip install "transformers>=5.3.0"')
-            print("  NOTE: This may break other ComfyUI nodes that")
-            print("        depend on older versions of transformers.")
-            print("=" * 60)
-            print("[OmniVoice] Skipping auto-upgrade — user must decide.")
-            # Don't return — continue so other deps (soxr, pydub, etc.) still install.
-            # The node itself will warn again at runtime.
+            raise ImportError("transformers is too old")
         else:
             print("[OmniVoice] Already installed correctly. Skipping.")
             return
     except (ImportError, ValueError, AttributeError):
-        pass
+        if vendor_dir in sys.path:
+            sys.path.remove(vendor_dir)
 
     print("=" * 60)
     print("[OmniVoice] Installation starting...")
     print("=" * 60)
 
-    # STEP 1: Verify PyTorch is healthy (we do NOT modify it)
+    # STEP 1: Verify PyTorch is healthy
     print("")
     print("[OmniVoice] Step 1: Checking PyTorch...")
     torch_version, has_cuda = check_torch()
@@ -127,16 +121,10 @@ def main():
         print(f"[OmniVoice] PyTorch {torch_version} with CUDA - OK")
     else:
         print(f"[OmniVoice] WARNING: PyTorch {torch_version} - No CUDA detected")
-        print("[OmniVoice] Your GPU may not work in ComfyUI!")
-        print("[OmniVoice] See: https://pytorch.org/get-started/locally/")
 
-    # STEP 2: Install omnivoice with --no-deps (CRITICAL!)
-    # This prevents it from downgrading PyTorch
+    # STEP 2: Install omnivoice with --no-deps
     print("")
     print("[OmniVoice] Step 2: Installing omnivoice...")
-    print("[OmniVoice] Using --no-deps to protect your PyTorch installation")
-
-    # First uninstall if exists (to ensure clean install with --no-deps)
     if is_installed("omnivoice"):
         run_cmd([sys.executable, "-m", "pip", "uninstall", "-y", "omnivoice"], timeout=60)
 
@@ -144,16 +132,20 @@ def main():
         print("[OmniVoice] omnivoice installed successfully")
     else:
         print("[OmniVoice] ERROR: Failed to install omnivoice")
-        print("[OmniVoice] Try manually: pip install omnivoice --no-deps")
 
-    # STEP 3: Install additional packages that omnivoice needs
-    # Only install if not already present
+    # STEP 2.5: Install isolated dependencies to the vendor folder
+    print("")
+    print("[OmniVoice] Step 2.5: Installing isolated dependencies to vendor folder...")
+    os.makedirs(vendor_dir, exist_ok=True)
+    pip_install("transformers>=5.3.0", no_deps=True, upgrade=True, target=vendor_dir)
+    pip_install("huggingface_hub", no_deps=True, upgrade=True, target=vendor_dir)
+
+    # STEP 3: Install additional packages that omnivoice needs globally
     print("")
     print("[OmniVoice] Step 3: Installing additional dependencies...")
 
-    # These packages are NOT in ComfyUI by default and don't depend on torch
+    # Removed huggingface_hub from extra_packages since it is now vendored
     extra_packages = [
-        # (import_name, pip_name, description)
         ("soundfile", "soundfile", "Audio file I/O"),
         ("scipy", "scipy", "Scientific computing (required by librosa resampling)"),
         ("lazy_loader", "lazy_loader", "Lazy loading utility (required by librosa)"),
@@ -162,11 +154,8 @@ def main():
         ("jieba", "jieba", "Chinese text segmentation"),
         ("pydub", "pydub", "Audio manipulation (required by omnivoice at import time)"),
         ("soxr", "soxr", "Audio resampling (required by transformers HiggsAudio tokenizer)"),
-        ("huggingface_hub", "huggingface_hub", "HuggingFace model downloads"),
     ]
 
-    # Packages safe to install with --no-deps (no transitive deps that
-    # aren't already in a standard ComfyUI environment).
     no_deps_packages = {"soundfile", "sentencepiece", "jieba", "scipy", "lazy_loader", "librosa", "soxr"}
 
     for import_name, pip_name, description in extra_packages:
@@ -177,7 +166,6 @@ def main():
             use_no_deps = pip_name in no_deps_packages
             success = pip_install(pip_name, no_deps=use_no_deps)
             if not success:
-                # Last resort: force pip directly
                 run_cmd([sys.executable, "-m", "pip", "install", pip_name])
 
     # STEP 4: Final verification
@@ -188,13 +176,17 @@ def main():
     print("")
     print("[OmniVoice] Verification:")
 
-    # Check omnivoice
+    # Check omnivoice using the vendored path
     try:
         importlib.invalidate_caches()
         spec = importlib.util.find_spec("omnivoice")
         if spec is None:
             raise ImportError("omnivoice not found on disk")
-        # Actually execute it to catch runtime crashes
+        
+        vendor_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "vendor")
+        if vendor_dir not in sys.path:
+            sys.path.insert(0, vendor_dir)
+            
         import omnivoice  # noqa: F401
         print("  [OK] omnivoice")
     except Exception as e:

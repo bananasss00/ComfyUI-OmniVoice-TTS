@@ -267,82 +267,84 @@ class OmniVoiceVoiceDesignTTS:
         postprocess_output: bool,
         keep_model_loaded: bool,
     ) -> Tuple[dict]:
-        cancel_event.clear()
-        self._check_interrupt()
+        from .vendor_context import vendored_transformers
+        with vendored_transformers():
+            cancel_event.clear()
+            self._check_interrupt()
 
-        if not text.strip():
-            raise ValueError("Text cannot be empty.")
+            if not text.strip():
+                raise ValueError("Text cannot be empty.")
 
-        if not voice_instruct.strip():
-            logger.warning(
-                "No voice instruction provided. A random voice will be used. "
-                "Consider adding attributes like 'female, low pitch, british accent'."
+            if not voice_instruct.strip():
+                logger.warning(
+                    "No voice instruction provided. A random voice will be used. "
+                    "Consider adding attributes like 'female, low pitch, british accent'."
+                )
+
+            # Load or get cached model
+            omnivoice_model, _ = get_or_load_model(
+                model, device, dtype, attention, keep_model_loaded
             )
 
-        # Load or get cached model
-        omnivoice_model, _ = get_or_load_model(
-            model, device, dtype, attention, keep_model_loaded
-        )
+            pbar = ProgressBar(3) if _PBAR else None
 
-        pbar = ProgressBar(3) if _PBAR else None
-
-        # Log what we're generating
-        logger.info(f"Voice Design TTS: {text[:80]}{'...' if len(text) > 80 else ''}")
-        logger.info(f"Voice attributes: {voice_instruct}")
-
-        if pbar:
-            pbar.update_absolute(1, 3)
-
-        # Set random seed
-        actual_seed = seed if seed != 0 else torch.randint(0, 2**31, (1,)).item()
-        manual_seed_all(actual_seed)
-
-        self._check_interrupt()
-
-        result = None
-        try:
-            # Build kwargs for generate
-            gen_kwargs = {
-                "text": text,
-                "instruct": voice_instruct,
-                "num_step": steps,
-                "guidance_scale": guidance_scale,
-                "t_shift": t_shift,
-                "speed": speed,
-                "position_temperature": position_temperature,
-                "class_temperature": class_temperature,
-                "layer_penalty_factor": layer_penalty_factor,
-                "denoise": denoise,
-                "postprocess_output": postprocess_output,
-            }
-            if duration > 0:
-                gen_kwargs["duration"] = duration
-
-            # Generate audio with voice design
-            with torch.inference_mode():
-                audio_list = omnivoice_model.generate(**gen_kwargs)
+            # Log what we're generating
+            logger.info(f"Voice Design TTS: {text[:80]}{'...' if len(text) > 80 else ''}")
+            logger.info(f"Voice attributes: {voice_instruct}")
 
             if pbar:
-                pbar.update_absolute(2, 3)
+                pbar.update_absolute(1, 3)
 
-            # Convert to ComfyUI format
-            audio_np = to_numpy_audio(audio_list[0])
+            # Set random seed
+            actual_seed = seed if seed != 0 else torch.randint(0, 2**31, (1,)).item()
+            manual_seed_all(actual_seed)
 
-            result = numpy_audio_to_comfy(audio_np, OMNIVOICE_SAMPLE_RATE)
+            self._check_interrupt()
 
-            logger.info(
-                f"Generated {len(audio_np) / OMNIVOICE_SAMPLE_RATE:.2f}s of audio "
-                f"at {OMNIVOICE_SAMPLE_RATE}Hz with designed voice"
-            )
+            result = None
+            try:
+                # Build kwargs for generate
+                gen_kwargs = {
+                    "text": text,
+                    "instruct": voice_instruct,
+                    "num_step": steps,
+                    "guidance_scale": guidance_scale,
+                    "t_shift": t_shift,
+                    "speed": speed,
+                    "position_temperature": position_temperature,
+                    "class_temperature": class_temperature,
+                    "layer_penalty_factor": layer_penalty_factor,
+                    "denoise": denoise,
+                    "postprocess_output": postprocess_output,
+                }
+                if duration > 0:
+                    gen_kwargs["duration"] = duration
 
-            if pbar:
-                pbar.update_absolute(3, 3)
+                # Generate audio with voice design
+                with torch.inference_mode():
+                    audio_list = omnivoice_model.generate(**gen_kwargs)
 
-        finally:
-            if not keep_model_loaded:
-                unload_model()
-            else:
-                offload_model_to_cpu()
+                if pbar:
+                    pbar.update_absolute(2, 3)
+
+                # Convert to ComfyUI format
+                audio_np = to_numpy_audio(audio_list[0])
+
+                result = numpy_audio_to_comfy(audio_np, OMNIVOICE_SAMPLE_RATE)
+
+                logger.info(
+                    f"Generated {len(audio_np) / OMNIVOICE_SAMPLE_RATE:.2f}s of audio "
+                    f"at {OMNIVOICE_SAMPLE_RATE}Hz with designed voice"
+                )
+
+                if pbar:
+                    pbar.update_absolute(3, 3)
+
+            finally:
+                if not keep_model_loaded:
+                    unload_model()
+                else:
+                    offload_model_to_cpu()
 
         if result is None:
             raise RuntimeError("Generation failed — see logs above.")
